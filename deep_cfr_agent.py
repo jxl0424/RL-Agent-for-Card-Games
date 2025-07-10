@@ -3,6 +3,15 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 import random
+import copy
+import rlcard
+from rlcard.utils import get_device
+
+def copy_env(env):
+    env_copy = rlcard.make('no-limit-holdem', config={'game_num_players': 3})
+    env_copy.game = copy.deepcopy(env.game)
+    return env_copy
+
 
 class DeepCFRNetwork(nn.Module):
     """Neural network for Deep CFR agent"""
@@ -188,6 +197,9 @@ class DeepCFRAgent:
             strategies.append(strat)
         states = torch.stack(states)
         strategies = torch.stack(strategies)
+        
+        # Fix: Ensure strategies tensor is on the correct device
+        strategies = strategies.to(self.device)
 
         logits = self.strategy_network(states)
         probs = torch.softmax(logits, dim=1)
@@ -198,24 +210,31 @@ class DeepCFRAgent:
         self.strategy_optimizer.step()
 
     def traverse_tree(self, env, state, player):
-        if state['done']:
-            return state['payoffs'][player]
+        if env.is_over():
+            # In RLCard, payoffs are typically obtained from the environment
+            # after the game ends, not from the state dictionary
+            payoffs = env.get_payoffs()
+            return payoffs[player]
 
-        current_player = state['current_player']
+        current_player = env.get_player_id()
 
         if current_player == player:
             state_tensor = self._state_to_tensor(state).unsqueeze(0)
             regrets = self.regret_network(state_tensor).detach().squeeze(0)
             strategy = self._get_regret_matching_strategy(regrets)
 
-            action_utils = torch.zeros(self.num_actions)
+            # Fix: Ensure action_utils is on the same device as strategy
+            action_utils = torch.zeros(self.num_actions, device=self.device)
 
             legal_actions = list(state['legal_actions'].keys())
 
             for action in legal_actions:
-                env_copy = copy_env(env)  # ← uses the function defined above
-                next_state, _, done, _ = env_copy.step(action)
-                action_utils[action] = self.traverse_tree(env_copy, next_state, player)
+                env_copy = copy_env(env)
+                # Fix: RLCard step() returns (next_state, next_player_id)
+                next_state, next_player_id = env_copy.step(action)
+                utility = self.traverse_tree(env_copy, next_state, player)
+                # Convert utility to tensor on the correct device
+                action_utils[action] = torch.tensor(utility, device=self.device)
 
             node_util = torch.dot(strategy, action_utils)
             advantages = action_utils - node_util
@@ -230,14 +249,14 @@ class DeepCFRAgent:
         else:
             legal_actions = list(state['legal_actions'].keys())
             action = np.random.choice(legal_actions)
-            next_state, _, done, _ = env.step(action)
+            # Fix: RLCard step() returns (next_state, next_player_id)
+            next_state, next_player_id = env.step(action)
             return self.traverse_tree(env, next_state, player)
-
-
+        
     def sample_advantage_memory(self, env, num_traversals=100):
         for _ in range(num_traversals):
-            state, _ = env.reset()
-            self.traverse_tree(env, state, player=state['current_player'])
+            state, player_id = env.reset()
+            self.traverse_tree(env, state, player=player_id)
 
     def save_model(self, path):
         torch.save({
